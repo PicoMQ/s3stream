@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "s3stream-codec",
+    "s3stream-object",
+    "s3stream-wal",
+    "s3stream-core",
+    "s3stream",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+description = "A durable stream engine on object storage."
+repository = "https://github.com/PicoMQ/s3stream"
+
+[workspace.dependencies]
+s3stream-codec = { path = "s3stream-codec" }
+s3stream-object = { path = "s3stream-object" }
+s3stream-wal = { path = "s3stream-wal" }
+s3stream-core = { path = "s3stream-core" }
+
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "macros", "io-util"] }
+async-trait = "0.1.92"
+futures = "0.3.34"
+
+bytes = "1.12.1"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+metrics = "0.24.6"
+crc32fast = "1.5.1"
+lru = "0.18.4"
+fastrand = "2.5.0"
+md-5 = "0.11.0"
+hex = "0.4.3"
+object_store = { version = "0.14.1", features = ["aws"] }
+
+proptest = "1.11.0"
+tokio-test = "0.4.5"
+serde_json = "1.0.151"
+criterion = "0.8.2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+todo = "allow"
