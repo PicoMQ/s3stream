@@ -10,34 +10,43 @@ use tokio::sync::OnceCell;
 
 use s3stream_codec::StreamRecordBatch;
 
+use crate::composite::{ObjectIndex, component_of, parse_composite};
 use crate::error::ObjectError;
 use crate::index::{DataBlockIndex, FindIndexResult, IndexBlock};
-use crate::metadata::S3ObjectMetadata;
+use crate::metadata::{S3ObjectMetadata, gen_object_key};
 use crate::storage::{ObjectStorage, ReadOptions, ThrottleStrategy};
 use crate::writer::{BLOCK_HEADER_SIZE, DATA_BLOCK_MAGIC, FOOTER_MAGIC, FOOTER_SIZE};
 
 /// Parsed footer + index of one object. Cheap to keep cached per object.
 #[derive(Debug, Clone)]
 pub struct BasicObjectInfo {
-    /// Byte size of the data section (== index block start position).
+    /// Byte size of the data section (== index block start position). 0 for a
+    /// composite object, whose blocks live in its component objects.
     pub data_block_size: u64,
     pub index_block: IndexBlock,
 }
 
 /// Reader over one committed object. Interior caching replaces manual
 /// retain/release.
+///
+/// A composite object (attributes COMPOSITE bit) is read through its linked
+/// components: its index entries keep the positions of the component objects,
+/// and `read_block` fetches each block from the component that owns it.
 pub struct ObjectReader {
     metadata: S3ObjectMetadata,
     storage: Arc<dyn ObjectStorage>,
     read_options: ReadOptions,
-    info: OnceCell<BasicObjectInfo>,
+    info: OnceCell<ParsedObject>,
+}
+
+struct ParsedObject {
+    info: BasicObjectInfo,
+    /// Components of a composite object; empty for a plain object.
+    components: Vec<ObjectIndex>,
 }
 
 impl ObjectReader {
-    /// Open a reader (no I/O yet).
-    ///
-    /// Composite objects
-    /// (attributes COMPOSITE bit) must be opened via `composite::CompositeObjectReader`
+    /// Open a reader (no I/O yet). Works for plain and composite objects.
     pub fn new(metadata: S3ObjectMetadata, storage: Arc<dyn ObjectStorage>) -> Self {
         let read_options = ReadOptions {
             bucket_id: Some(metadata.attributes.bucket_id()),
@@ -54,9 +63,29 @@ impl ObjectReader {
     /// Fetch and parse footer + index block (cached after first call). Two
     /// ranged GETs: footer, then index. (An over-read of the tail could
     /// usually save the second GET. That optimization is deferred.)
+    ///
+    /// A composite object is small (index only) and is read in one GET.
     pub async fn basic_object_info(&self) -> Result<&BasicObjectInfo, ObjectError> {
+        Ok(&self.parsed().await?.info)
+    }
+
+    async fn parsed(&self) -> Result<&ParsedObject, ObjectError> {
         self.info
             .get_or_try_init(|| async {
+                if self.metadata.attributes.is_composite() {
+                    let buf = self
+                        .storage
+                        .range_read(&self.read_options, &self.metadata.key(), 0, None)
+                        .await?;
+                    let composite = parse_composite(&buf)?;
+                    return Ok(ParsedObject {
+                        info: BasicObjectInfo {
+                            data_block_size: 0,
+                            index_block: composite.index_block,
+                        },
+                        components: composite.objects,
+                    });
+                }
                 let object_size = self.metadata.object_size;
                 if object_size < FOOTER_SIZE as u64 {
                     return Err(ObjectError::InvalidFormat {
@@ -102,9 +131,12 @@ impl ObjectReader {
                         Some(index_position + index_size),
                     )
                     .await?;
-                Ok(BasicObjectInfo {
-                    data_block_size: index_position,
-                    index_block: IndexBlock::parse(&index_bytes)?,
+                Ok(ParsedObject {
+                    info: BasicObjectInfo {
+                        data_block_size: index_position,
+                        index_block: IndexBlock::parse(&index_bytes)?,
+                    },
+                    components: Vec::new(),
                 })
             })
             .await
@@ -138,14 +170,22 @@ impl ObjectReader {
         index: &DataBlockIndex,
         throttle: ThrottleStrategy,
     ) -> Result<Bytes, ObjectError> {
-        let options = ReadOptions {
+        let mut options = ReadOptions {
             throttle,
             ..self.read_options.clone()
+        };
+        let key = if self.metadata.attributes.is_composite() {
+            let parsed = self.parsed().await?;
+            let component = component_of(&parsed.components, index.block_id as u32)?;
+            options.bucket_id = Some(component.bucket_id);
+            gen_object_key(0, component.object_id)
+        } else {
+            self.metadata.key()
         };
         self.storage
             .range_read(
                 &options,
-                &self.metadata.key(),
+                &key,
                 index.start_position,
                 Some(index.end_position()),
             )
@@ -161,7 +201,7 @@ impl ObjectReader {
     pub fn cached_index_bytes(&self) -> usize {
         self.info
             .get()
-            .map(|info| info.index_block.entries().len() * crate::index::BLOCK_INDEX_SIZE)
+            .map(|parsed| parsed.info.index_block.entries().len() * crate::index::BLOCK_INDEX_SIZE)
             .unwrap_or(0)
     }
 
@@ -348,6 +388,57 @@ mod tests {
             }
             let _ = NOOP_OFFSET;
         }
+    }
+
+    /// A composite object reads through its components: its index keeps the
+    /// component positions and `read_block` fetches from the owning component.
+    #[tokio::test]
+    async fn reads_composite_object_through_components() {
+        use crate::composite::CompositeObjectWriter;
+
+        let storage = Arc::new(MemoryObjectStorage::new(0));
+        let inputs: Vec<StreamRecordBatch> = (0..20)
+            .map(|i| record(7, i, format!("payload-{i}").as_bytes()))
+            .collect();
+        let mut composite = CompositeObjectWriter::new(3, WriteOptions::default());
+        for (object_id, records) in [(1, &inputs[..10]), (2, &inputs[10..])] {
+            let mut writer = ObjectWriter::open(
+                object_id,
+                storage.as_ref(),
+                64,
+                16 << 20,
+                WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+            writer.write(7, records).await.unwrap();
+            let size = writer.close().await.unwrap();
+            let component = object_metadata(object_id, size);
+            let info = ObjectReader::new(component.clone(), storage.clone())
+                .basic_object_info()
+                .await
+                .unwrap()
+                .clone();
+            composite
+                .add_component(&component, info.index_block.entries().to_vec())
+                .unwrap();
+        }
+        composite.close(storage.as_ref()).await.unwrap();
+
+        // Committed as compaction does: COMPOSITE bit, retained (not physical) size.
+        let metadata = S3ObjectMetadata {
+            attributes: ObjectAttributes::new(0, true, false),
+            ..object_metadata(3, composite.size())
+        };
+        let reader = ObjectReader::new(metadata, storage.clone());
+        let found = reader.find(7, 0, 20, usize::MAX).await.unwrap();
+        assert!(found.fulfilled);
+        let mut read_back = Vec::new();
+        for index in &found.blocks {
+            let block = reader.read_block(index).await.unwrap();
+            read_back.extend(decode_data_block(&block).unwrap());
+        }
+        assert_eq!(read_back, inputs);
     }
 
     /// Corrupt footer magic must fail with InvalidFormat, not panic.

@@ -78,7 +78,10 @@ Source: `s3.CompositeObject{,Writer,Reader}`. A composite object links component
 compaction without rewriting data. Layout: an object containing only an index of
 (component objectId, block indexes) plus footer — no data blocks of its own. Port the
 exact layout from `CompositeObjectWriter` when implementing `composite.rs`
-(attributes bit `COMPOSITE` in `ObjectAttributes` marks them).
+(attributes bit `COMPOSITE` in `ObjectAttributes` marks them). A composite's committed
+`object_size` is the retained size of its linked blocks, not its physical size, and its
+index positions are relative to the component objects, so readers must resolve every block
+through the component that owns it; `ObjectReader` does this for any object with the bit.
 
 ## Conformance
 

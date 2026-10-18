@@ -158,13 +158,21 @@ pub struct CompositeObjectInfo {
 impl CompositeObjectInfo {
     /// Resolve the component owning block ordinal `block_id`.
     pub fn component_of(&self, block_id: u32) -> Result<&ObjectIndex, ObjectError> {
-        self.objects
-            .iter()
-            .find(|o| o.block_start_index <= block_id && block_id < o.block_end_index)
-            .ok_or_else(|| ObjectError::InvalidFormat {
-                reason: format!("no component owns block ordinal {block_id}"),
-            })
+        component_of(&self.objects, block_id)
     }
+}
+
+/// Resolve the component in `objects` owning block ordinal `block_id`.
+pub(crate) fn component_of(
+    objects: &[ObjectIndex],
+    block_id: u32,
+) -> Result<&ObjectIndex, ObjectError> {
+    objects
+        .iter()
+        .find(|o| o.block_start_index <= block_id && block_id < o.block_end_index)
+        .ok_or_else(|| ObjectError::InvalidFormat {
+            reason: format!("no component owns block ordinal {block_id}"),
+        })
 }
 
 /// Reader for a composite object: resolves block reads to the owning component object.
@@ -240,7 +248,7 @@ impl CompositeObjectReader {
 }
 
 /// Parse composite object bytes into objects + index blocks.
-fn parse_composite(buf: &Bytes) -> Result<CompositeObjectInfo, ObjectError> {
+pub(crate) fn parse_composite(buf: &Bytes) -> Result<CompositeObjectInfo, ObjectError> {
     if buf.len() < FOOTER_SIZE + OBJECT_BLOCK_HEADER_SIZE {
         return Err(ObjectError::InvalidFormat {
             reason: format!("composite object too small: {} bytes", buf.len()),
