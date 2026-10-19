@@ -689,18 +689,21 @@ impl StorageInner {
         let (archived, added) = {
             let _guard = self.cache_put_lock.lock().expect("cache put poisoned");
             let mut added = self.log_cache.put(record.clone());
-            let mut archived = None;
+            let mut archived = false;
             if !added {
-                archived = self
+                if let Some(block) = self
                     .log_cache
-                    .archive_current_block_if_contains(MATCH_ALL_STREAMS);
+                    .archive_current_block_if_contains(MATCH_ALL_STREAMS)
+                {
+                    self.submit_block_upload(block, false);
+                    archived = true;
+                }
                 added = self.log_cache.put(record.clone());
             }
             self.log_cache.set_last_record_offset(offset);
             (archived, added)
         };
-        if let Some(block) = archived {
-            self.submit_block_upload(block, false);
+        if archived {
             self.notify_lazy_upload();
         }
         if !added {
@@ -801,20 +804,22 @@ impl StorageInner {
     }
 
     fn upload_delta_wal(self: &Arc<Self>, stream_id: u64, force: bool) -> Completion {
-        let block = {
+        let cf = {
             let _guard = self.cache_put_lock.lock().expect("cache put poisoned");
-            self.log_cache.archive_current_block_if_contains(stream_id)
-        };
-        let cf = match block {
-            Some(block) => self.submit_block_upload(block, force),
-            None => Completion::completed(),
+            match self.log_cache.archive_current_block_if_contains(stream_id) {
+                Some(block) => self.submit_block_upload(block, force),
+                None => Completion::completed(),
+            }
         };
         self.notify_lazy_upload();
         cf
     }
 
     /// Build the upload task (rate from write pressure), register it
-    /// inflight, and feed the ordered prepare pipeline.
+    /// inflight, and feed the ordered prepare pipeline. Callers hold
+    /// `cache_put_lock` from archiving the block until here, so a block is
+    /// never out of the cache without being inflight, which `force_upload`
+    /// relies on to wait for every block holding its stream.
     fn submit_block_upload(self: &Arc<Self>, block: Arc<LogCacheBlock>, force: bool) -> Completion {
         let elapsed_ms = block.created().elapsed().as_millis() as u64;
         let rate = if force || elapsed_ms <= 100 {
@@ -1338,6 +1343,47 @@ mod tests {
             .unwrap();
         assert_eq!(read.records.len(), 64);
         continuous_check(&read.records).unwrap();
+        h.storage.shutdown().await;
+    }
+
+    /// `force_upload(stream)` returns only once every record of that stream is
+    /// committed, even when other streams' force uploads take the block first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_force_uploads_each_wait_for_their_stream() {
+        let h = Arc::new(harness(S3StorageConfig::test_defaults()));
+        h.storage.startup().await.unwrap();
+        let mut streams = Vec::new();
+        for _ in 0..4 {
+            streams.push(open_stream(&h.manager).await);
+        }
+
+        for offset in 0..50u64 {
+            for &stream_id in &streams {
+                h.storage
+                    .append(
+                        AppendContext::default(),
+                        record(stream_id, offset, 1, &[1; 128]),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let uploads = streams.iter().map(|&stream_id| {
+                let h = Arc::clone(&h);
+                tokio::spawn(async move {
+                    h.storage.force_upload(stream_id).await.unwrap();
+                    h.manager.get_streams(&[stream_id]).await.unwrap()[0].end_offset
+                })
+            });
+            for committed in futures::future::join_all(uploads).await {
+                assert_eq!(
+                    committed.unwrap(),
+                    offset + 1,
+                    "force_upload returned early"
+                );
+            }
+        }
+
         h.storage.shutdown().await;
     }
 
