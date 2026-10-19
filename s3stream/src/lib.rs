@@ -43,7 +43,7 @@ pub use s3stream_core::memory::{MemoryKvClient, MemoryMetadataManager};
 pub use s3stream_core::metrics;
 pub use s3stream_core::{
     DefaultFailoverFactory, Failover, FailoverFactory, FailoverRequest, FailoverResponse,
-    StreamClient as StreamClientTrait, StreamError as Error,
+    StorageFailureHandler, StreamClient as StreamClientTrait, StreamError as Error,
 };
 pub use s3stream_object::{
     NOOP_OBJECT_ID, ObjectAttributes, ObjectStreamRange, S3ObjectType, StreamOffsetRange,
@@ -53,8 +53,10 @@ pub use s3stream_object::{ObjectStorage as ObjectStorageTrait, S3ObjectMetadata}
 // scheme and path/error types.
 pub use s3stream_object::{IdUri, MemoryObjectStorage, ObjectStoreAdapter};
 pub use s3stream_object::{ObjectError, ObjectPath, gen_object_key};
-pub use s3stream_wal::object::{ObjectWalConfig, ObjectWalService};
-pub use s3stream_wal::{OpenMode, WalError, WriteAheadLog as WriteAheadLogTrait};
+pub use s3stream_wal::object::{ObjectReservationService, ObjectWalConfig, ObjectWalService};
+pub use s3stream_wal::{
+    OpenMode, ReservationService, WalError, WriteAheadLog as WriteAheadLogTrait,
+};
 
 /// A wired, started engine: storage pipeline + stream client + compaction.
 ///
@@ -134,7 +136,7 @@ pub struct S3StreamBuilder {
     wal: Option<Arc<dyn WriteAheadLog>>,
     object_manager: Option<Arc<dyn ObjectManager>>,
     stream_manager: Option<Arc<dyn StreamManager>>,
-    failure_handler: Option<Arc<dyn s3stream_core::StorageFailureHandler>>,
+    failure_handler: Option<Arc<dyn StorageFailureHandler>>,
     kv_client: Option<Arc<dyn KVClient>>,
     failover_factory: Option<Arc<dyn FailoverFactory>>,
 }
@@ -178,10 +180,7 @@ impl S3StreamBuilder {
     /// Override the storage-failure handler (default: log only). Hosts that
     /// want self-eviction should pass a chain ending in Halt. Halt must not
     /// be wired in tests.
-    pub fn storage_failure_handler(
-        mut self,
-        handler: Arc<dyn s3stream_core::StorageFailureHandler>,
-    ) -> Self {
+    pub fn storage_failure_handler(mut self, handler: Arc<dyn StorageFailureHandler>) -> Self {
         self.failure_handler = Some(handler);
         self
     }
