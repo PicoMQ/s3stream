@@ -16,7 +16,7 @@ s3stream (facade: Config, builder)
 
 ```toml
 [dependencies]
-s3stream = { git = "https://github.com/PicoMQ/s3stream", tag = "v0.1.0" }
+s3stream = { git = "https://github.com/PicoMQ/s3stream", tag = "v0.1.1" }
 ```
 
 ## Build
