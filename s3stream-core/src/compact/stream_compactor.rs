@@ -683,6 +683,51 @@ mod tests {
         assert_eq!(objects[0].object_id, live);
     }
 
+    /// After MAJOR_V1, the stream's records still read through the block cache,
+    /// which resolves the composite object's blocks to its components.
+    #[tokio::test]
+    async fn major_v1_composite_reads_through_block_cache() {
+        use crate::cache::block_cache::{DirectBlockCache, S3BlockCache};
+
+        let h = harness().await;
+        let stream_id = h.manager.create_stream(Default::default()).await.unwrap();
+        h.manager
+            .open_stream(stream_id, 1, Default::default())
+            .await
+            .unwrap();
+        h.put_stream_object(stream_id, 0, 4).await;
+        h.put_stream_object(stream_id, 4, 4).await;
+
+        let compactor = StreamObjectCompactor::new(
+            h.manager.clone() as Arc<dyn ObjectManager>,
+            h.storage.clone() as Arc<dyn ObjectStorage>,
+            1 << 30,
+        );
+        let view = StreamView {
+            stream_id,
+            stream_epoch: 1,
+            start_offset: 0,
+            confirm_offset: 8,
+        };
+        compactor
+            .compact(view, CompactionLevel::MajorV1)
+            .await
+            .unwrap();
+        assert!(
+            h.stream_objects(stream_id).await[0]
+                .attributes
+                .is_composite()
+        );
+
+        let cache = DirectBlockCache::new(
+            h.manager.clone() as Arc<dyn ObjectManager>,
+            h.storage.clone() as Arc<dyn ObjectStorage>,
+        );
+        let read = cache.read(stream_id, 0, 8, usize::MAX).await.unwrap();
+        let offsets: Vec<u64> = read.records.iter().map(|r| r.base_offset()).collect();
+        assert_eq!(offsets, (0..8).collect::<Vec<_>>());
+    }
+
     /// MAJOR_V1 links normal objects into a composite object without copying data.
     /// The composite reads back with all component blocks.
     #[tokio::test]
