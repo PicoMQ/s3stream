@@ -254,7 +254,9 @@ impl ObjectStoreAdapter {
     /// Supported protocols:
     /// - `s3`: AWS S3 or compatible. Honors `region`, `endpoint`, `pathStyle`,
     ///   `s3Express` query builder chain).
-    /// - `file`: local filesystem rooted at the path (dev/test).
+    /// - `file`: local filesystem rooted at the path. Honors `fsync`: with
+    ///   `fsync=true`, a completed write has been synced to disk with its parent
+    ///   directory, so it survives a power loss; the default skips that (dev/test).
     /// - `mem`: in-memory backend (tests).
     pub fn from_bucket_uri(uri: &str) -> Result<Self, ObjectError> {
         let uri = IdUri::parse(uri)?;
@@ -262,7 +264,8 @@ impl ObjectStoreAdapter {
             "s3" => std::sync::Arc::new(s3_builder(&uri).build().map_err(ObjectError::Backend)?),
             "file" => std::sync::Arc::new(
                 object_store::local::LocalFileSystem::new_with_prefix(&uri.path)
-                    .map_err(ObjectError::Backend)?,
+                    .map_err(ObjectError::Backend)?
+                    .with_fsync(uri.extension_bool("fsync", false)),
             ),
             "mem" => std::sync::Arc::new(object_store::memory::InMemory::new()),
             other => {
@@ -586,6 +589,25 @@ mod tests {
         assert_eq!(adapter.bucket_id(), 3);
         adapter.readiness_check().await.unwrap();
         contract(&adapter).await;
+    }
+
+    #[tokio::test]
+    async fn file_adapter_contract_with_and_without_fsync() {
+        for fsync in [true, false] {
+            let dir = std::env::temp_dir().join(format!(
+                "s3stream-file-contract-{}-{fsync}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let adapter = ObjectStoreAdapter::from_bucket_uri(&format!(
+                "4@file://{}?fsync={fsync}",
+                dir.display()
+            ))
+            .unwrap();
+            assert_eq!(adapter.bucket_id(), 4);
+            contract(&adapter).await;
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[tokio::test]
